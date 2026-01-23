@@ -371,10 +371,23 @@ func (s *Server) WithPprofEnabled(pprofEnabled bool) *Server {
 	return s
 }
 
-// WithH2CEnabled sets whether h2c ("HTTP/2 cleartext") is enabled for the http listener
+// WithH2CEnabled sets whether h2c ("HTTP/2 cleartext") is enabled for HTTP and Unix socket listeners.
+// H2C allows HTTP/2 over non-TLS connections. Note: H2C does not provide encryption - use HTTPS for
+// encrypted HTTP/2 connections. H2C is useful for internal services or when TLS is terminated elsewhere
+// (e.g., by a reverse proxy or load balancer).
 func (s *Server) WithH2CEnabled(enabled bool) *Server {
 	s.h2cEnabled = enabled
 	return s
+}
+
+// wrapWithH2CIfEnabled wraps the handler with H2C support if enabled.
+// This allows HTTP/2 over cleartext (non-TLS) connections.
+func (s *Server) wrapWithH2CIfEnabled(h http.Handler) http.Handler {
+	if s.h2cEnabled {
+		h2s := &http2.Server{}
+		h = h2c.NewHandler(h, h2s)
+	}
+	return h
 }
 
 // WithDecisionLogger sets the decision logger used by the
@@ -651,10 +664,7 @@ func (s *Server) getListener(addr string, h http.Handler, t httpListenerType) ([
 }
 
 func (s *Server) getListenerForHTTPServer(u *url.URL, h http.Handler, t httpListenerType) (Loop, httpListener, error) {
-	if s.h2cEnabled {
-		h2s := &http2.Server{}
-		h = h2c.NewHandler(h, h2s)
-	}
+	h = s.wrapWithH2CIfEnabled(h)
 	h1s := http.Server{
 		Addr:    u.Host,
 		Handler: h,
@@ -726,6 +736,7 @@ func (s *Server) getListenerForUNIXSocket(u *url.URL, h http.Handler, t httpList
 		os.Remove(socketPath)
 	}
 
+	h = s.wrapWithH2CIfEnabled(h)
 	domainSocketServer := http.Server{Handler: h}
 	unixListener, err := net.Listen("unix", socketPath)
 	if err != nil {

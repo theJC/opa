@@ -40,6 +40,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	"golang.org/x/net/http2"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/open-policy-agent/opa/internal/distributedtracing"
@@ -7020,5 +7021,347 @@ data.baz.qux`,
 				}
 			}
 		})
+	}
+}
+
+func TestH2CWithUnixSocket(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	// Create a temporary unix socket path
+	tmpDir := t.TempDir()
+	socketPath := filepath.Join(tmpDir, "opa.sock")
+	socketAddr := "unix://" + socketPath
+
+	// Create server with h2c enabled and unix socket
+	store := inmem.New()
+	server := New().
+		WithAddresses([]string{socketAddr}).
+		WithStore(store).
+		WithH2CEnabled(true)
+
+	m, err := plugins.New([]byte{}, "test", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server = server.WithManager(m)
+
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err = server.Init(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loops, err := server.Listeners()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start the server in background
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, loop := range loops {
+			if err := loop(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				t.Logf("Server loop error: %v", err)
+			}
+		}
+	}()
+	defer func() {
+		if err := server.Shutdown(ctx); err != nil {
+			t.Logf("Server shutdown error: %v", err)
+		}
+		<-done
+	}()
+
+	// Create an HTTP/2 client that can connect over unix socket
+	client := &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.Dial("unix", socketPath)
+			},
+		},
+	}
+
+	// Wait for server to be ready
+	var lastErr error
+	for i := range 100 {
+		resp, err := client.Get("http://unix/health")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		lastErr = err
+		if i == 99 {
+			t.Fatalf("Server failed to start after 10 seconds: %v", lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Make a request to verify the server is working
+	resp, err := client.Get("http://unix/health")
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Verify HTTP/2 protocol was used
+	if resp.ProtoMajor != 2 {
+		t.Errorf("Expected HTTP/2 (ProtoMajor=2), got HTTP/%d.%d", resp.ProtoMajor, resp.ProtoMinor)
+	}
+	if resp.Proto != "HTTP/2.0" {
+		t.Errorf("Expected protocol HTTP/2.0, got %s", resp.Proto)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
+	}
+
+	// Verify we got a valid JSON response
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+}
+
+func TestH2CWithHTTPListener(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	// Create server with h2c enabled and HTTP listener
+	store := inmem.New()
+	server := New().
+		WithAddresses([]string{"localhost:0"}).
+		WithStore(store).
+		WithH2CEnabled(true)
+
+	m, err := plugins.New([]byte{}, "test", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server = server.WithManager(m)
+
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err = server.Init(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loops, err := server.Listeners()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start the server in background
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, loop := range loops {
+			if err := loop(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				t.Logf("Server loop error: %v", err)
+			}
+		}
+	}()
+	defer func() {
+		if err := server.Shutdown(ctx); err != nil {
+			t.Logf("Server shutdown error: %v", err)
+		}
+		<-done
+	}()
+
+	// Wait for server to start listening and get the actual server address
+	var serverAddr string
+	for i := range 100 {
+		addrs := server.Addrs()
+		if len(addrs) > 0 {
+			serverAddr = addrs[0]
+			break
+		}
+		if i == 99 {
+			t.Fatal("Server failed to start listening after 10 seconds")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Create an HTTP/2 client
+	client := &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.Dial("tcp", serverAddr)
+			},
+		},
+	}
+
+	// Wait for server to be ready
+	var lastErr error
+	healthURL := "http://" + serverAddr + "/health"
+	for i := range 100 {
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		lastErr = err
+		if i == 99 {
+			t.Fatalf("Server failed to start after 10 seconds: %v", lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Make a request to verify the server is working
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Verify HTTP/2 protocol was used
+	if resp.ProtoMajor != 2 {
+		t.Errorf("Expected HTTP/2 (ProtoMajor=2), got HTTP/%d.%d", resp.ProtoMajor, resp.ProtoMinor)
+	}
+	if resp.Proto != "HTTP/2.0" {
+		t.Errorf("Expected protocol HTTP/2.0, got %s", resp.Proto)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
+	}
+
+	// Verify we got a valid JSON response
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+}
+func TestH2CDisabled(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	// Create server WITHOUT h2c enabled
+	store := inmem.New()
+	server := New().
+		WithAddresses([]string{"localhost:0"}).
+		WithStore(store)
+	// Note: NOT calling WithH2CEnabled(true)
+
+	m, err := plugins.New([]byte{}, "test", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server = server.WithManager(m)
+
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err = server.Init(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loops, err := server.Listeners()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start the server in background
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, loop := range loops {
+			if err := loop(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				t.Logf("Server loop error: %v", err)
+			}
+		}
+	}()
+	defer func() {
+		if err := server.Shutdown(ctx); err != nil {
+			t.Logf("Server shutdown error: %v", err)
+		}
+		<-done
+	}()
+
+	// Wait for server to start listening and get the actual server address
+	var serverAddr string
+	for i := range 100 {
+		addrs := server.Addrs()
+		if len(addrs) > 0 {
+			serverAddr = addrs[0]
+			break
+		}
+		if i == 99 {
+			t.Fatal("Server failed to start listening after 10 seconds")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Create a regular HTTP/1.1 client
+	client := &http.Client{}
+
+	// Wait for server to be ready
+	var lastErr error
+	healthURL := "http://" + serverAddr + "/health"
+	for i := range 100 {
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		lastErr = err
+		if i == 99 {
+			t.Fatalf("Server failed to start after 10 seconds: %v", lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Make a request to verify the server is working
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Verify HTTP/1.1 protocol was used (not HTTP/2)
+	if resp.ProtoMajor != 1 {
+		t.Errorf("Expected HTTP/1.x (ProtoMajor=1), got HTTP/%d.%d", resp.ProtoMajor, resp.ProtoMinor)
+	}
+	if !strings.HasPrefix(resp.Proto, "HTTP/1.") {
+		t.Errorf("Expected protocol HTTP/1.x, got %s", resp.Proto)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
+	}
+
+	// Verify we got a valid JSON response
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
 	}
 }
