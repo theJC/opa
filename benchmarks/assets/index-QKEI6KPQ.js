@@ -1,5 +1,5 @@
-import { N as NodeSet, a as NodeType, s as styleTags, P as Parser, b as NodeProp, c as Tag, T as Tree, t as tags } from "./highlight-zPA9wXSh.js";
-import "./index-B3w2jP38.js";
+import { N as NodeSet, a as NodeType, s as styleTags, P as Parser, b as NodeProp, c as Tag, T as Tree, t as tags } from "./highlight-CB9TTsiY.js";
+import "./index-_SKf9ZVq.js";
 class CompositeBlock {
   static create(type, value, from, parentHash, end) {
     let hash = parentHash + (parentHash << 8) + type + (value << 4) | 0;
